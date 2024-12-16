@@ -1,156 +1,136 @@
-﻿var config = require('config.json');
-var _ = require('lodash');
-var jwt = require('jsonwebtoken');
-var bcrypt = require('bcryptjs');
-var Q = require('q');
-var mongo = require('mongoskin');
-var db = mongo.db(config.connectionString, { native_parser: true });
-db.bind('users');
+﻿const { MongoClient, ObjectId } = require('mongodb');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const config = require('config.json');
 
-var service = {};
+// MongoDB Connection
+const client = new MongoClient(config.connectionString);
+const dbName = 'your-database-name'; // Replace with your database name
+let db;
 
-service.authenticate = authenticate;
-service.getById = getById;
-service.create = create;
-service.update = update;
-service.delete = _delete;
+// Initialize MongoDB connection
+(async () => {
+    try {
+        await client.connect();
+        db = client.db(dbName);
+        console.log('Connected to MongoDB');
+    } catch (err) {
+        console.error('MongoDB connection error:', err);
+    }
+})();
+
+// Service object
+const service = {
+    authenticate,
+    getById,
+    create,
+    update,
+    delete: _delete, // "delete" is a reserved keyword, use "_delete"
+};
 
 module.exports = service;
 
-function authenticate(username, password) {
-    var deferred = Q.defer();
-
-    db.users.findOne({ username: username }, function (err, user) {
-        if (err) deferred.reject(err.name + ': ' + err.message);
-
+// Authenticate user
+async function authenticate(username, password) {
+    try {
+        const user = await db.collection('users').findOne({ username });
         if (user && bcrypt.compareSync(password, user.hash)) {
-            // authentication successful
-            deferred.resolve(jwt.sign({ sub: user._id }, config.secret));
+            // Authentication successful
+            return jwt.sign({ sub: user._id }, config.secret);
         } else {
-            // authentication failed
-            deferred.resolve();
+            // Authentication failed
+            return null;
         }
-    });
-
-    return deferred.promise;
-}
-
-function getById(_id) {
-    var deferred = Q.defer();
-
-    db.users.findById(_id, function (err, user) {
-        if (err) deferred.reject(err.name + ': ' + err.message);
-
-        if (user) {
-            // return user (without hashed password)
-            deferred.resolve(_.omit(user, 'hash'));
-        } else {
-            // user not found
-            deferred.resolve();
-        }
-    });
-
-    return deferred.promise;
-}
-
-function create(userParam) {
-    var deferred = Q.defer();
-
-    // validation
-    db.users.findOne(
-        { username: userParam.username },
-        function (err, user) {
-            if (err) deferred.reject(err.name + ': ' + err.message);
-
-            if (user) {
-                // username already exists
-                deferred.reject('Username "' + userParam.username + '" is already taken');
-            } else {
-                createUser();
-            }
-        });
-
-    function createUser() {
-        // set user object to userParam without the cleartext password
-        var user = _.omit(userParam, 'password');
-
-        // add hashed password to user object
-        user.hash = bcrypt.hashSync(userParam.password, 10);
-
-        db.users.insert(
-            user,
-            function (err, doc) {
-                if (err) deferred.reject(err.name + ': ' + err.message);
-
-                deferred.resolve();
-            });
+    } catch (err) {
+        throw new Error(err.message);
     }
-
-    return deferred.promise;
 }
 
-function update(_id, userParam) {
-    var deferred = Q.defer();
+// Get user by ID
+async function getById(_id) {
+    try {
+        const user = await db.collection('users').findOne({ _id: new ObjectId(_id) });
+        if (!user) return null;
+        // Return user without password hash
+        return omitHash(user);
+    } catch (err) {
+        throw new Error(err.message);
+    }
+}
 
-    // validation
-    db.users.findById(_id, function (err, user) {
-        if (err) deferred.reject(err.name + ': ' + err.message);
+// Create new user
+async function create(userParam) {
+    try {
+        // Check if username is already taken
+        const existingUser = await db.collection('users').findOne({ username: userParam.username });
+        if (existingUser) {
+            throw new Error(`Username "${userParam.username}" is already taken`);
+        }
+
+        // Hash password
+        const user = {
+            ...userParam,
+            hash: bcrypt.hashSync(userParam.password, 10),
+        };
+        delete user.password; // Remove plain-text password
+
+        // Insert user into database
+        await db.collection('users').insertOne(user);
+    } catch (err) {
+        throw new Error(err.message);
+    }
+}
+
+// Update user
+async function update(_id, userParam) {
+    try {
+        const user = await db.collection('users').findOne({ _id: new ObjectId(_id) });
+
+        if (!user) {
+            throw new Error('User not found');
+        }
 
         if (user.username !== userParam.username) {
-            // username has changed so check if the new username is already taken
-            db.users.findOne(
-                { username: userParam.username },
-                function (err, user) {
-                    if (err) deferred.reject(err.name + ': ' + err.message);
-
-                    if (user) {
-                        // username already exists
-                        deferred.reject('Username "' + req.body.username + '" is already taken')
-                    } else {
-                        updateUser();
-                    }
-                });
-        } else {
-            updateUser();
+            // Check if the new username is already taken
+            const existingUser = await db.collection('users').findOne({ username: userParam.username });
+            if (existingUser) {
+                throw new Error(`Username "${userParam.username}" is already taken`);
+            }
         }
-    });
 
-    function updateUser() {
-        // fields to update
-        var set = {
+        // Fields to update
+        const updateFields = {
             firstName: userParam.firstName,
             lastName: userParam.lastName,
             username: userParam.username,
         };
 
-        // update password if it was entered
+        // Update password if provided
         if (userParam.password) {
-            set.hash = bcrypt.hashSync(userParam.password, 10);
+            updateFields.hash = bcrypt.hashSync(userParam.password, 10);
         }
 
-        db.users.update(
-            { _id: mongo.helper.toObjectID(_id) },
-            { $set: set },
-            function (err, doc) {
-                if (err) deferred.reject(err.name + ': ' + err.message);
-
-                deferred.resolve();
-            });
+        // Update the user in the database
+        await db.collection('users').updateOne(
+            { _id: new ObjectId(_id) },
+            { $set: updateFields }
+        );
+    } catch (err) {
+        throw new Error(err.message);
     }
-
-    return deferred.promise;
 }
 
-function _delete(_id) {
-    var deferred = Q.defer();
+// Delete user
+async function _delete(_id) {
+    try {
+        await db.collection('users').deleteOne({ _id: new ObjectId(_id) });
+    } catch (err) {
+        throw new Error(err.message);
+    }
+}
 
-    db.users.remove(
-        { _id: mongo.helper.toObjectID(_id) },
-        function (err) {
-            if (err) deferred.reject(err.name + ': ' + err.message);
-
-            deferred.resolve();
-        });
-
-    return deferred.promise;
+// Helper function to omit hash from user object
+function omitHash(user) {
+    const { hash, ...userWithoutHash } = user;
+    return userWithoutHash;
 }
